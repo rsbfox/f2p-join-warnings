@@ -11,10 +11,16 @@ import net.runelite.client.config.Units;
 @ConfigGroup("joinwarnings")
 public interface JoinWarningsConfig extends Config
 {
+	String GROUP = "joinwarnings";
+
+	String HIGHLIGHT_NAMES_KEY = "highlightNames";
+	String IGNORED_PLAYERS_KEY = "ignoredPlayersString";
+	String HIGHLIGHT_COLOR_KEY = "highlightColor";
+
 	@ConfigItem(
 		keyName = "rejoinTimeout",
 		name = "Rejoin timeout",
-		description = "Delay before warning again on rejoin.",
+		description = "Time before warning again on rejoin. 0 to always warn.",
 		position = 0
 	)
 	@Units(Units.MINUTES)
@@ -55,7 +61,7 @@ public interface JoinWarningsConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "highlightNames",
+		keyName = HIGHLIGHT_NAMES_KEY,
 		name = "Highlight names",
 		description = "Highlight flagged player names in chat messages and the member list.",
 		position = 98
@@ -65,7 +71,7 @@ public interface JoinWarningsConfig extends Config
 		return true;
 	}
 	@ConfigItem(
-		keyName = "highlightColor",
+		keyName = HIGHLIGHT_COLOR_KEY,
 		name = "Highlight color",
 		description = "Set the color of the warning message and name highlights.",
 		position = 99
@@ -77,9 +83,9 @@ public interface JoinWarningsConfig extends Config
 
 	@ConfigItem(
 		position = 100,
-		keyName = "ignoredPlayersString",
+		keyName = IGNORED_PLAYERS_KEY,
 		name = "Ignored players",
-		description = "Comma-separated list of player names to ignore (case-insensitive)."
+		description = "Players who are never warned about or highlighted. Comma-separated, case-insensitive."
 	)
 	default String ignoredPlayersString()
 	{

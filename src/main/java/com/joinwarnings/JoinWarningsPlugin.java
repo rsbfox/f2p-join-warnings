@@ -2,6 +2,12 @@ package com.joinwarnings;
 
 import com.google.common.base.MoreObjects;
 import com.google.inject.Provides;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
+import java.util.regex.Pattern;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
@@ -11,11 +17,11 @@ import net.runelite.api.FriendsChatMember;
 import net.runelite.api.FriendsChatRank;
 import net.runelite.api.MessageNode;
 import net.runelite.api.ScriptID;
-import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.FriendsChatChanged;
 import net.runelite.api.events.FriendsChatMemberJoined;
 import net.runelite.api.events.FriendsChatMemberLeft;
 import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.VarbitID;
@@ -27,12 +33,14 @@ import net.runelite.client.config.ChatColorConfig;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.WorldsFetch;
 import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.util.ColorUtil;
 import net.runelite.client.util.Text;
 import net.runelite.http.api.worlds.World;
+import net.runelite.http.api.worlds.WorldResult;
 import net.runelite.http.api.worlds.WorldType;
 import org.apache.commons.lang3.StringUtils;
 
@@ -48,14 +56,17 @@ import static net.runelite.client.ui.JagexColors.CHAT_FC_NAME_OPAQUE_BACKGROUND;
 import static net.runelite.client.ui.JagexColors.CHAT_FC_NAME_TRANSPARENT_BACKGROUND;
 
 @Slf4j
-@PluginDescriptor(
-	name = "F2P Join Warnings"
-)
+@PluginDescriptor(name = "F2P Join Warnings")
 public class JoinWarningsPlugin extends Plugin
 {
-	private final Map<String, Integer> playerLeaveTicks = new HashMap<>();
+	private static final Pattern COL_TAG = Pattern.compile("</?col(=[^>]*)?>");
+
+	private final Map<String, Instant> lastLeft = new HashMap<>();
+	private final Set<String> presentMembers = new HashSet<>();
 	private final Set<String> ignoredPlayers = new HashSet<>();
 	private final Set<String> flaggedPlayers = new HashSet<>();
+
+	private volatile Set<Integer> f2pWorlds = Collections.emptySet();
 
 	@Inject
 	private Client client;
@@ -68,6 +79,9 @@ public class JoinWarningsPlugin extends Plugin
 
 	@Inject
 	private ClientThread clientThread;
+
+	@Inject
+	private ScheduledExecutorService executor;
 
 	@Inject
 	private WorldService worldService;
@@ -86,31 +100,87 @@ public class JoinWarningsPlugin extends Plugin
 	@Override
 	protected void startUp() throws Exception
 	{
-		playerLeaveTicks.clear();
-		flaggedPlayers.clear();
 		updateIgnoredPlayers();
-		updateFlaggedPlayers();
+		executor.execute(() -> {
+			final WorldResult result = worldService.getWorlds();
+			if (result != null)
+			{
+				updateF2pWorlds(result);
+			}
+		});
 	}
 
 	@Override
 	protected void shutDown() throws Exception
 	{
-		playerLeaveTicks.clear();
+		lastLeft.clear();
+		presentMembers.clear();
+		ignoredPlayers.clear();
 		flaggedPlayers.clear();
-		clientThread.invoke(this::applyMemberListHighlight);
+		if (config.highlightNames())
+		{
+			clientThread.invokeLater(() -> {
+				resetMemberListHighlight();
+				client.refreshChat();
+			});
+		}
+	}
+
+	@Subscribe
+	public void onWorldsFetch(WorldsFetch event)
+	{
+		if (!f2pWorlds.isEmpty())
+		{
+			return;
+		}
+
+		updateF2pWorlds(event.getWorldResult());
+	}
+
+	private void updateF2pWorlds(WorldResult result)
+	{
+		final Set<Integer> f2pWorlds = new HashSet<>();
+		for (World world : result.getWorlds())
+		{
+			if (!world.getTypes().contains(WorldType.MEMBERS))
+			{
+				f2pWorlds.add(world.getId());
+			}
+		}
+		this.f2pWorlds = f2pWorlds;
+		updateFlaggedPlayers();
 	}
 
 	@Subscribe
 	public void onConfigChanged(ConfigChanged configChanged)
 	{
-		if (!configChanged.getGroup().equals("joinwarnings"))
+		if (!configChanged.getGroup().equals(JoinWarningsConfig.GROUP))
 		{
 			return;
 		}
 
-		updateIgnoredPlayers();
-		flaggedPlayers.removeAll(ignoredPlayers);
-		updateFlaggedPlayers();
+		switch (configChanged.getKey())
+		{
+			case JoinWarningsConfig.HIGHLIGHT_NAMES_KEY:
+			case JoinWarningsConfig.HIGHLIGHT_COLOR_KEY:
+				clientThread.invokeLater(() -> {
+					if (config.highlightNames())
+					{
+						applyMemberListHighlight();
+					}
+					else
+					{
+						resetMemberListHighlight();
+					}
+					client.refreshChat();
+				});
+				break;
+			case JoinWarningsConfig.IGNORED_PLAYERS_KEY:
+				updateIgnoredPlayers();
+				flaggedPlayers.removeAll(ignoredPlayers);
+				updateFlaggedPlayers();
+				break;
+		}
 	}
 
 	@Subscribe
@@ -127,17 +197,47 @@ public class JoinWarningsPlugin extends Plugin
 		}
 	}
 
+	// run after chat name colors plugin
+	@Subscribe(priority = -1)
+	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		if (!config.highlightNames() || flaggedPlayers.isEmpty() || !"chatMessageBuilding".equals(event.getEventName()))
+		{
+			return;
+		}
+
+		// based on https://github.com/runelite/runelite/blob/e98399f931c60bfa8e42f924da850f508ec8e00d/runelite-client/src/main/java/net/runelite/client/chat/ChatMessageManager.java#L102
+		final int[] intStack = client.getIntStack();
+		final Object[] objectStack = client.getObjectStack();
+		final int isize = client.getIntStackSize();
+		final int osize = client.getObjectStackSize();
+		final int uid = intStack[isize - 1];
+
+		final MessageNode messageNode = client.getMessages().get(uid);
+		if (messageNode == null || messageNode.getType() != ChatMessageType.FRIENDSCHAT)
+		{
+			return;
+		}
+
+		final String username = (String) objectStack[osize - 3];
+		if (!flaggedPlayers.contains(Text.toJagexName(Text.removeTags(username)).toLowerCase()))
+		{
+			return;
+		}
+
+		objectStack[osize - 3] = ColorUtil.wrapWithColorTag(removeColTags(username), config.hightlightColor());
+	}
+
 	@Subscribe
 	public void onFriendsChatChanged(FriendsChatChanged event)
 	{
-		playerLeaveTicks.clear();
-		flaggedPlayers.clear();
-
 		if (!event.isJoined())
 		{
 			return;
 		}
 
+		flaggedPlayers.clear();
+		presentMembers.clear();
 		joinedTick = client.getTickCount();
 		updateFlaggedPlayers();
 	}
@@ -145,24 +245,35 @@ public class JoinWarningsPlugin extends Plugin
 	@Subscribe
 	public void onFriendsChatMemberJoined(FriendsChatMemberJoined event)
 	{
+		final FriendsChatMember member = event.getMember();
+		// workaround: ignore joins for players already present
+		if (!presentMembers.add(member.getName()))
+		{
+			return;
+		}
+
 		// ignore events from joining chat
 		if (joinedTick == client.getTickCount())
 		{
 			return;
 		}
 
-		final FriendsChatMember member = event.getMember();
-
 		if (!shouldFlag(member))
 		{
+			// remove players that hopped from f2p to members
+			flaggedPlayers.remove(Text.toJagexName(member.getName()).toLowerCase());
 			return;
 		}
 
 		flaggedPlayers.add(Text.toJagexName(member.getName()).toLowerCase());
-		applyMemberListHighlight();
 
-		final Integer lastLeaveTick = playerLeaveTicks.get(member.getName());
-		if (lastLeaveTick != null && client.getTickCount() - lastLeaveTick <= config.getTimeout() * 100)
+		if (config.highlightNames())
+		{
+			applyMemberListHighlight();
+		}
+
+		final Instant left = lastLeft.get(member.getName());
+		if (left != null && Duration.between(left, Instant.now()).toMinutes() < config.getTimeout())
 		{
 			return;
 		}
@@ -209,31 +320,8 @@ public class JoinWarningsPlugin extends Plugin
 	{
 		final FriendsChatMember member = event.getMember();
 
-		flaggedPlayers.remove(Text.toJagexName(member.getName()).toLowerCase());
-		playerLeaveTicks.put(member.getName(), client.getTickCount());
-	}
-
-	@Subscribe
-	public void onChatMessage(ChatMessage chatMessage)
-	{
-		if (!config.highlightNames())
-		{
-			return;
-		}
-
-		if (chatMessage.getType() != ChatMessageType.FRIENDSCHAT)
-		{
-			return;
-		}
-
-		final MessageNode messageNode = chatMessage.getMessageNode();
-		final String name = Text.toJagexName(Text.removeTags(chatMessage.getName())).toLowerCase();
-
-		if (flaggedPlayers.contains(name))
-		{
-			messageNode.setName(ColorUtil.wrapWithColorTag(chatMessage.getName(), config.hightlightColor()));
-			messageNode.setRuneLiteFormatMessage(messageNode.getValue());
-		}
+		presentMembers.remove(member.getName());
+		lastLeft.put(member.getName(), Instant.now());
 	}
 
 	@Subscribe
@@ -293,7 +381,11 @@ public class JoinWarningsPlugin extends Plugin
 				}
 			}
 
-			applyMemberListHighlight();
+			if (config.highlightNames())
+			{
+				applyMemberListHighlight();
+				client.refreshChat();
+			}
 
 			return true;
 		});
@@ -301,8 +393,16 @@ public class JoinWarningsPlugin extends Plugin
 
 	private void applyMemberListHighlight()
 	{
-		final boolean enabled = config.highlightNames();
+		colorMemberList(name -> flaggedPlayers.contains(name) ? config.hightlightColor() : Color.WHITE);
+	}
 
+	private void resetMemberListHighlight()
+	{
+		colorMemberList(name -> Color.WHITE);
+	}
+
+	private void colorMemberList(Function<String, Color> colorForName)
+	{
 		final Widget chatList = client.getWidget(InterfaceID.ChatchannelCurrent.LIST);
 		if (chatList == null || chatList.getChildren() == null)
 		{
@@ -312,22 +412,19 @@ public class JoinWarningsPlugin extends Plugin
 		final Widget[] children = chatList.getChildren();
 		for (int i = 0; i < children.length; i += 3)
 		{
-			final Widget listWidget = children[i];
-
-			if (!enabled)
+			if (children[i] == null)
 			{
-				listWidget.setTextColor(Color.WHITE.getRGB());
 				continue;
 			}
 
-			final String name = Text.toJagexName(StringUtils.defaultString(listWidget.getText())).toLowerCase();
-			listWidget.setTextColor(flaggedPlayers.contains(name) ? config.hightlightColor().getRGB() : Color.WHITE.getRGB());
+			final String name = Text.toJagexName(StringUtils.defaultString(children[i].getText())).toLowerCase();
+			children[i].setTextColor(colorForName.apply(name).getRGB());
 		}
 	}
 
 	private boolean shouldFlag(FriendsChatMember member)
 	{
-		if (!member.getRank().equals(FriendsChatRank.UNRANKED))
+		if (member.getRank() != FriendsChatRank.UNRANKED)
 		{
 			return false;
 		}
@@ -337,7 +434,11 @@ public class JoinWarningsPlugin extends Plugin
 			return false;
 		}
 
-		World world = worldService.getWorlds().findWorld(member.getWorld());
-		return world != null && !world.getTypes().contains(WorldType.MEMBERS);
+		return f2pWorlds.contains(member.getWorld());
+	}
+
+	private static String removeColTags(String str)
+	{
+		return COL_TAG.matcher(str).replaceAll("");
 	}
 }
