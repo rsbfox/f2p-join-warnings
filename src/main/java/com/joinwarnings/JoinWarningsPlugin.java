@@ -1,6 +1,5 @@
 package com.joinwarnings;
 
-import com.google.common.base.MoreObjects;
 import com.google.inject.Provides;
 import java.time.Duration;
 import java.time.Instant;
@@ -24,7 +23,6 @@ import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.gameval.InterfaceID;
-import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
@@ -52,8 +50,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static net.runelite.client.ui.JagexColors.CHAT_FC_NAME_OPAQUE_BACKGROUND;
-import static net.runelite.client.ui.JagexColors.CHAT_FC_NAME_TRANSPARENT_BACKGROUND;
 
 @Slf4j
 @PluginDescriptor(name = "F2P Join Warnings")
@@ -286,33 +282,14 @@ public class JoinWarningsPlugin extends Plugin
 				return;
 			}
 
-			final Color infoColor, channelColor;
-			if (client.isResized() && client.getVarbitValue(VarbitID.CHATBOX_TRANSPARENCY) == 1)
-			{
-				infoColor = MoreObjects.firstNonNull(chatColorConfig.transparentFriendsChatInfo(), Color.WHITE);
-				channelColor = MoreObjects.firstNonNull(chatColorConfig.transparentFriendsChatChannelName(), CHAT_FC_NAME_TRANSPARENT_BACKGROUND);
-			}
-			else
-			{
-				infoColor = MoreObjects.firstNonNull(chatColorConfig.opaqueFriendsChatInfo(), Color.BLACK);
-				channelColor = MoreObjects.firstNonNull(chatColorConfig.opaqueFriendsChatChannelName(), CHAT_FC_NAME_OPAQUE_BACKGROUND);
-			}
-
-			ChatMessageBuilder message = new ChatMessageBuilder()
-				.append(infoColor, "[")
-				.append(channelColor, friendsChatManager.getName())
-				.append(infoColor, "] ")
-				.append(infoColor, member.getName() + " has joined. ")
-				.append(config.hightlightColor(), "(Unranked F2P)");
-
-			client.addChatMessage(ChatMessageType.FRIENDSCHATNOTIFICATION, "", message.build(), "");
+			ChatMessageBuilder message = new ChatMessageBuilder().append(config.hightlightColor(), "has joined. (F2P)");
+			client.addChatMessage(ChatMessageType.FRIENDSCHAT, member.getName(), message.build(), friendsChatManager.getName());
 		}
 
 		if (config.sendFriendsChatNotification().isEnabled())
 		{
-			notifier.notify(config.sendFriendsChatNotification(), member.getName() + " has joined. (Unranked F2P)");
+			notifier.notify(config.sendFriendsChatNotification(), member.getName() + " has joined. (F2P)");
 		}
-
 	}
 
 	@Subscribe
